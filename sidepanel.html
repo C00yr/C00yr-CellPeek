@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CellPeek</title>
+    <link rel="stylesheet" href="sidepanel.css">
+  </head>
+  <body>
+    <main class="fz-shell">
+      <header class="fz-toolbar">
+        <div class="fz-title">CellPeek</div>
+        <div class="fz-actions">
+          <button class="fz-btn fz-active" data-action="split-single" title="单栏">单</button>
+          <button class="fz-btn" data-action="split-vertical" title="左右分栏">左右</button>
+          <button class="fz-btn" data-action="split-horizontal" title="上下分栏">上下</button>
+        </div>
+      </header>
+
+      <section class="fz-panes fz-single">
+        <article class="fz-pane fz-pane-active" data-pane="0">
+          <div class="fz-pane-head">
+            <div class="fz-view-mode" aria-label="展示模式">
+              <button class="fz-mode-btn fz-active" data-mode="auto">自动</button>
+              <button class="fz-mode-btn" data-mode="md">MD</button>
+              <button class="fz-mode-btn" data-mode="json">JSON</button>
+              <button class="fz-mode-btn" data-mode="raw">原文</button>
+            </div>
+            <div class="fz-pane-actions">
+              <button class="fz-btn fz-lock-btn" data-action="lock" title="点击锁定" aria-label="点击锁定">🔓</button>
+            </div>
+          </div>
+          <div class="fz-content"></div>
+        </article>
+
+        <div class="fz-splitter" data-action="resize-split" title="拖动调整分栏大小"></div>
+
+        <article class="fz-pane" data-pane="1">
+          <div class="fz-pane-head">
+            <div class="fz-view-mode" aria-label="展示模式">
+              <button class="fz-mode-btn fz-active" data-mode="auto">自动</button>
+              <button class="fz-mode-btn" data-mode="md">MD</button>
+              <button class="fz-mode-btn" data-mode="json">JSON</button>
+              <button class="fz-mode-btn" data-mode="raw">原文</button>
+            </div>
+            <div class="fz-pane-actions">
+              <button class="fz-btn fz-lock-btn" data-action="lock" title="点击锁定" aria-label="点击锁定">🔓</button>
+            </div>
+          </div>
+          <div class="fz-content"></div>
+        </article>
+      </section>
+
+      <section class="fz-debug">
+        <button class="fz-debug-toggle" data-action="toggle-debug" aria-expanded="false">
+          调试
+          <span class="fz-debug-alert-dot" hidden></span>
+        </button>
+        <div class="fz-debug-panel" hidden>
+          <div class="fz-debug-head">
+            <span class="fz-debug-count">最近 0 条</span>
+            <div class="fz-debug-actions">
+              <button class="fz-btn" data-action="copy-debug">复制调试信息</button>
+              <button class="fz-btn" data-action="clear-debug">清空</button>
+            </div>
+          </div>
+          <pre class="fz-debug-content">暂无调试记录</pre>
+        </div>
+      </section>
+
+      <div class="fz-toast"></div>
+    </main>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>
