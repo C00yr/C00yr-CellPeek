@@ -4,9 +4,9 @@
   if (window.__fzCellPreviewListenerInstalled) return;
   window.__fzCellPreviewListenerInstalled = true;
 
-  const RETRY_DELAYS = [0, 30, 80, 150, 260, 420];
-  const CAPTURE_TIMEOUT_MS = 800;
-  const EARLY_EMPTY_MIN_STEP_INDEX = 1;
+  const RETRY_DELAYS = [0, 20, 50, 100, 200, 360];
+  const CAPTURE_TIMEOUT_MS = 650;
+  const EARLY_EMPTY_MIN_STEP_INDEX = 2;
   const EARLY_EMPTY_REQUIRED_HITS = 2;
   const MAX_SEARCH_DEPTH = 10;
 
@@ -58,10 +58,19 @@
     }
   }, false);
 
-  chrome.runtime.onMessage.addListener((message) => {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || typeof message.type !== "string") return;
     if (message.type === "FZ_CAPTURE_CURRENT_CELL") {
       captureCurrentActiveCell();
+    }
+    if (message.type === "FZ_WRITE_CELL") {
+      writeCellFromPanelDetailed(message).then(sendResponse).catch((error) => {
+        sendResponse({
+          ok: false,
+          reason: error && error.message ? error.message : "WRITE_CELL_FAILED"
+        });
+      });
+      return true;
     }
   });
 
@@ -97,8 +106,10 @@
 
   function runCaptureAttempt(session, target, stepIndex) {
     if (!isSessionActive(session)) return;
-    const freshAddress = resolveCellAddress(target, session.clickContext);
-    if (freshAddress) session.cellAddress = freshAddress;
+    if (!session.cellAddress || stepIndex <= 2) {
+      const freshAddress = resolveCellAddress(target, session.clickContext);
+      if (freshAddress) session.cellAddress = freshAddress;
+    }
 
     const probes = [
       { key: "formula", source: "公式栏输入区", run: probeFormulaBarText },
@@ -323,6 +334,51 @@
       return { ok: true, debugSessionId: debugSession.id, writeStrategy: "paste" };
     }
 
+    const nativePasteResult = await runNativeClipboardPasteStrategy(text, context, {
+      clipboardPrimed: Boolean(message && message.clipboardPrimed)
+    });
+    pushWriteAttempt(debugSession, {
+      step: step++,
+      source: "原生剪贴板粘贴策略",
+      hit: Boolean(nativePasteResult && nativePasteResult.ok),
+      reason: nativePasteResult && nativePasteResult.reason ? nativePasteResult.reason : "unknown",
+      candidateText: nativePasteResult && typeof nativePasteResult.observedFormula === "string" ? nativePasteResult.observedFormula : "",
+      details: nativePasteResult
+    });
+
+    if (nativePasteResult && nativePasteResult.ok) {
+      emitCellSelected(text, "原生粘贴写回", context);
+      pushWriteAttempt(debugSession, {
+        step: step++,
+        source: "回传侧栏预览",
+        hit: true,
+        reason: "sent_after_native_paste",
+        candidateText: text,
+        details: { source: "原生粘贴写回" }
+      });
+      emitWriteDebugSession(debugSession, "success", "native_paste_ok");
+      return { ok: true, debugSessionId: debugSession.id, writeStrategy: "native_paste" };
+    }
+
+    if (isNativePasteLikelyDispatched(nativePasteResult)) {
+      emitCellSelected(text, "原生粘贴写回(等待飞书同步)", context);
+      pushWriteAttempt(debugSession, {
+        step: step++,
+        source: "回传侧栏预览",
+        hit: true,
+        reason: "sent_after_native_paste_pending_lark_sync",
+        candidateText: text,
+        details: { source: "原生粘贴写回(等待飞书同步)" }
+      });
+      emitWriteDebugSession(debugSession, "success", "native_paste_dispatched_pending_lark_sync");
+      return {
+        ok: true,
+        debugSessionId: debugSession.id,
+        writeStrategy: "native_paste_pending_lark_sync",
+        pendingVerification: true
+      };
+    }
+
     const editorSelection = findWriteTargetEditorDetailed(context);
     const editor = editorSelection.editor;
     pushWriteAttempt(debugSession, {
@@ -337,7 +393,8 @@
         activeElement: describeElementForDebug(editorSelection.activeElement),
         formulaCandidates: editorSelection.formulaCandidates || [],
         fallbackCandidates: editorSelection.fallbackCandidates || [],
-        inCellCandidates: editorSelection.inCellCandidates || []
+        inCellCandidates: editorSelection.inCellCandidates || [],
+        activeFlags: editorSelection.activeFlags || {}
       }
     });
 
@@ -383,6 +440,25 @@
       candidateText: verifyResult && typeof verifyResult.observedFormula === "string" ? verifyResult.observedFormula : "",
       details: verifyResult
     });
+
+    if ((!verifyResult || !verifyResult.ok) && setResult && setResult.ok !== false && commitResult && commitResult.ok) {
+      emitCellSelected(text, "输入模式写回(等待飞书同步)", context);
+      pushWriteAttempt(debugSession, {
+        step: step++,
+        source: "回传侧栏预览",
+        hit: true,
+        reason: "sent_after_editor_commit_pending_lark_sync",
+        candidateText: text,
+        details: { source: "输入模式写回(等待飞书同步)" }
+      });
+      emitWriteDebugSession(debugSession, "success", "editor_commit_dispatched_pending_lark_sync");
+      return {
+        ok: true,
+        debugSessionId: debugSession.id,
+        writeStrategy: "editor_commit_pending_lark_sync",
+        pendingVerification: true
+      };
+    }
 
     if (!verifyResult || !verifyResult.ok) {
       emitWriteDebugSession(debugSession, "error", "WRITE_NOT_PERSISTED");
@@ -437,13 +513,16 @@
     const activeNearContext = isElementNearPoint(active, context, 220);
     const activeIsFormula = isFormulaEditorElement(active);
     const activeOnSheetCanvas = isElementInsideSheetCanvas(active, context);
+    const activeIsSheetProxy = isLikelySheetProxyEditor(active, context);
     const inCellCandidates = collectInCellEditableCandidates(context);
 
-    if (activeIsEditable && !activeIsFormula && (activeNearContext || activeOnSheetCanvas)) {
+    if (activeIsEditable && !activeIsFormula && (activeNearContext || activeOnSheetCanvas || activeIsSheetProxy)) {
       return {
         editor: active,
-        route: "active_element",
-        reason: activeNearContext ? "active_editor_near_click" : "active_editor_on_canvas",
+        route: activeIsSheetProxy ? "active_sheet_proxy" : "active_element",
+        reason: activeIsSheetProxy
+          ? "active_proxy_after_canvas_focus"
+          : (activeNearContext ? "active_editor_near_click" : "active_editor_on_canvas"),
         activeElement: active,
         formulaCandidates: [],
         fallbackCandidates: [],
@@ -451,7 +530,8 @@
         activeFlags: {
           activeIsEditable,
           activeNearContext,
-          activeOnSheetCanvas
+          activeOnSheetCanvas,
+          activeIsSheetProxy
         }
       };
     }
@@ -468,7 +548,8 @@
         activeFlags: {
           activeIsEditable,
           activeNearContext,
-          activeOnSheetCanvas
+          activeOnSheetCanvas,
+          activeIsSheetProxy
         }
       };
     }
@@ -484,7 +565,8 @@
       activeFlags: {
         activeIsEditable,
         activeNearContext,
-        activeOnSheetCanvas
+        activeOnSheetCanvas,
+        activeIsSheetProxy
       }
     };
   }
@@ -596,6 +678,39 @@
       centerY <= canvasRect.bottom + 20;
   }
 
+  function isLikelySheetProxyEditor(element, context) {
+    if (!(element instanceof Element) || !context) return false;
+    if (!isEditableElement(element) || isFormulaEditorElement(element)) return false;
+
+    const x = Number(context.x);
+    const y = Number(context.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+
+    const atPoint = document.elementFromPoint(x, y);
+    const pointOnSheetCanvas = atPoint instanceof Element && Boolean(atPoint.closest("canvas.faster-single-canvas"));
+    if (!pointOnSheetCanvas) return false;
+
+    const canvasRect = getSheetCanvasRect(context);
+    if (!canvasRect) return false;
+
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+
+    const classHint = `${element.className || ""} ${(element.closest("[class]") || {}).className || ""}`.toLowerCase();
+    if (/(search|filter|comment|menu|toolbar|formula|func)/.test(classHint)) return false;
+
+    const appearsOffscreen = rect.bottom <= canvasRect.top ||
+      rect.top >= canvasRect.bottom ||
+      rect.right <= canvasRect.left ||
+      rect.left >= canvasRect.right ||
+      rect.top < 0 ||
+      rect.left < 0 ||
+      rect.left >= window.innerWidth ||
+      rect.top >= window.innerHeight;
+    const appearsProxySized = rect.height <= 32 && rect.width >= 20;
+    return appearsOffscreen && appearsProxySized;
+  }
+
   function collectFormulaCandidateDiagnostics() {
     const seen = new Set();
     const candidates = [];
@@ -670,6 +785,8 @@
         resolvedContext: resolvedContext || null,
         incomingCellContext: normalizeCellContext(message && message.cellContext),
         cachedCellContext: lastCellContext || null,
+        clipboardPrimed: Boolean(message && message.clipboardPrimed),
+        clipboardPrime: message && message.clipboardPrime ? message.clipboardPrime : null,
         frameInfo: {
           isTopFrame: window === window.top,
           frameUrl: location.href
@@ -1123,6 +1240,222 @@
     };
   }
 
+  async function runNativeClipboardPasteStrategy(text, context, options = {}) {
+    const normalizedTarget = normalizeCellText(text);
+    const clipboardText = makeSingleCellClipboardText(text);
+    const actions = [];
+    const observations = [];
+
+    if (!clipboardText && normalizedTarget) {
+      return {
+        ok: false,
+        reason: "clipboard_text_empty",
+        observedFormula: "",
+        actions,
+        observations
+      };
+    }
+
+    if (context) {
+      const focusResult = focusCellByPointDetailed(context);
+      actions.push({ action: "focus_cell", ...focusResult });
+      await sleep(35);
+    }
+
+    const activeBeforePaste = resolveEditableRoot(getDeepActiveElement());
+    actions.push({ action: "active_before_paste", target: describeElementForDebug(activeBeforePaste) });
+
+    let clipboardWritten = Boolean(options && options.clipboardPrimed);
+    if (clipboardWritten) {
+      actions.push({ action: "use_prepared_clipboard", ok: true, textLength: clipboardText.length });
+    } else {
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+          await navigator.clipboard.writeText(clipboardText);
+          clipboardWritten = true;
+          actions.push({ action: "navigator_clipboard_write_text", ok: true, textLength: clipboardText.length });
+        } else {
+          actions.push({ action: "navigator_clipboard_write_text", ok: false, reason: "api_missing" });
+        }
+      } catch (error) {
+        actions.push({
+          action: "navigator_clipboard_write_text",
+          ok: false,
+          reason: error && error.message ? error.message : "clipboard_write_failed"
+        });
+      }
+    }
+
+    if (!clipboardWritten) {
+      return {
+        ok: false,
+        reason: "clipboard_write_failed",
+        observedFormula: normalizeCellText(probeFormulaBarText()),
+        actions,
+        observations
+      };
+    }
+
+    const pasteTargets = collectNativePasteCommandTargets(context);
+    for (let index = 0; index < pasteTargets.length; index += 1) {
+      const target = pasteTargets[index];
+      const targetDescription = describeEventTargetForDebug(target);
+      try {
+        if (target instanceof Element && typeof target.focus === "function") target.focus();
+      } catch (_) {}
+
+      let execResult = false;
+      let execError = "";
+      try {
+        execResult = typeof document.execCommand === "function" && document.execCommand("paste");
+      } catch (error) {
+        execError = error && error.message ? error.message : "exec_command_paste_failed";
+      }
+
+      const keyDispatch = dispatchPasteShortcut(target);
+      actions.push({
+        action: "native_paste_command",
+        index,
+        target: targetDescription,
+        execResult,
+        execError,
+        keyDispatch
+      });
+
+      await sleep(140);
+      const observedFormula = normalizeCellText(probeFormulaBarText());
+      const observedActive = normalizeCellText(extractEditableText(resolveEditableRoot(getDeepActiveElement())));
+      const matched = observedFormula === normalizedTarget;
+      observations.push({
+        index,
+        observedFormula,
+        observedActive,
+        matched
+      });
+
+      if (matched) {
+        return {
+          ok: true,
+          reason: "native_clipboard_paste_persisted",
+          observedFormula,
+          actions,
+          observations
+        };
+      }
+    }
+
+    const settleWaits = [240, 520, 900, 1400];
+    for (let round = 0; round < settleWaits.length; round += 1) {
+      await sleep(settleWaits[round]);
+      const observedFormula = normalizeCellText(probeFormulaBarText());
+      const observedActive = normalizeCellText(extractEditableText(resolveEditableRoot(getDeepActiveElement())));
+      const matched = observedFormula === normalizedTarget;
+      observations.push({
+        index: `settle-${round + 1}`,
+        waitMs: settleWaits[round],
+        observedFormula,
+        observedActive,
+        matched
+      });
+
+      if (matched) {
+        return {
+          ok: true,
+          reason: "native_clipboard_paste_persisted_after_settle",
+          observedFormula,
+          actions,
+          observations
+        };
+      }
+    }
+
+    return {
+      ok: false,
+      reason: "native_clipboard_paste_not_persisted",
+      observedFormula: observations.length ? observations[observations.length - 1].observedFormula : normalizeCellText(probeFormulaBarText()),
+      actions,
+      observations
+    };
+  }
+
+  function collectNativePasteCommandTargets(context) {
+    const targets = [];
+    const add = (target) => {
+      if (!target) return;
+      if (!(target instanceof EventTarget)) return;
+      if (targets.includes(target)) return;
+      targets.push(target);
+    };
+
+    add(resolveEditableRoot(getDeepActiveElement()));
+
+    if (context && Number.isFinite(context.x) && Number.isFinite(context.y)) {
+      const atPoint = document.elementFromPoint(context.x, context.y);
+      if (atPoint instanceof Element) {
+        add(atPoint.closest("canvas.faster-single-canvas"));
+      }
+      add(atPoint);
+    }
+
+    add(document.activeElement);
+    add(document.body);
+    add(document);
+    add(window);
+    return targets;
+  }
+
+  function dispatchPasteShortcut(target) {
+    const dispatches = [];
+    const eventTarget = target instanceof EventTarget ? target : document;
+    const init = {
+      bubbles: true,
+      cancelable: true,
+      key: "v",
+      code: "KeyV",
+      keyCode: 86,
+      which: 86,
+      ctrlKey: !isMacPlatform(),
+      metaKey: isMacPlatform()
+    };
+
+    ["keydown", "keypress", "keyup"].forEach((type) => {
+      try {
+        const dispatched = eventTarget.dispatchEvent(new KeyboardEvent(type, init));
+        dispatches.push({ type, dispatched });
+      } catch (error) {
+        dispatches.push({ type, dispatched: false, error: error && error.message ? error.message : "dispatch_failed" });
+      }
+    });
+
+    return dispatches;
+  }
+
+  function isMacPlatform() {
+    return /mac/i.test(navigator.platform || navigator.userAgent || "");
+  }
+
+  function isNativePasteLikelyDispatched(result) {
+    if (!result || result.ok) return false;
+    if (result.reason !== "native_clipboard_paste_not_persisted") return false;
+
+    const actions = Array.isArray(result.actions) ? result.actions : [];
+    const clipboardReady = actions.some((action) => {
+      return action &&
+        (action.action === "use_prepared_clipboard" || action.action === "navigator_clipboard_write_text") &&
+        action.ok === true;
+    });
+    if (!clipboardReady) return false;
+
+    return actions.some((action) => {
+      if (!action || action.action !== "native_paste_command") return false;
+      if (action.execResult === true) return true;
+      const dispatches = Array.isArray(action.keyDispatch) ? action.keyDispatch : [];
+      const down = dispatches.find((item) => item && item.type === "keydown");
+      const up = dispatches.find((item) => item && item.type === "keyup");
+      return Boolean(down && down.dispatched !== false && up && up.dispatched !== false);
+    });
+  }
+
   function collectPasteTargets(context) {
     const targets = [];
     const add = (target) => {
@@ -1229,7 +1562,7 @@
 
   async function verifyWritePersisted(targetText, context, editor) {
     const normalizedTarget = normalizeCellText(targetText);
-    const checkpoints = [40, 120, 240];
+    const checkpoints = [40, 120, 240, 520, 900, 1400];
     const observations = [];
 
     for (let i = 0; i < checkpoints.length; i += 1) {

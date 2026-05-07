@@ -96,7 +96,7 @@ body {
 .fz-panes.fz-single { grid-template-columns: 1fr; grid-template-rows: 1fr; }
 
 .fz-panes.fz-split-vertical {
-  grid-template-columns: minmax(56px, var(--split-a, 1fr)) 6px minmax(56px, var(--split-b, 1fr));
+  grid-template-columns: minmax(78px, var(--split-a, 1fr)) 6px minmax(78px, var(--split-b, 1fr));
   grid-template-rows: 1fr;
 }
 
@@ -158,10 +158,10 @@ body {
   display: flex;
   flex-wrap: nowrap;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   min-width: 0;
   min-height: 38px;
-  padding: 6px 8px 6px 12px;
+  padding: 6px 4px 6px 6px;
   border-bottom: 1px solid rgba(31, 35, 41, 0.08);
   background: #fbfbfc;
   overflow: hidden;
@@ -169,24 +169,24 @@ body {
 
 .fz-view-mode {
   display: flex;
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-width: 0;
-  max-width: 100%;
+  width: 0;
   flex-wrap: nowrap;
   gap: 2px;
   padding: 2px;
   border-radius: 6px;
   background: #eff1f5;
   white-space: nowrap;
-  overflow-x: auto;
+  overflow-x: hidden;
   overflow-y: hidden;
 }
 
 .fz-mode-btn {
-  flex: 1 1 auto;
-  min-width: 0;
+  flex: 1 1 0;
+  min-width: 8px;
   height: 24px;
-  padding: 0 7px;
+  padding: 0 3px;
   border: 0;
   border-radius: 5px;
   background: transparent;
@@ -195,7 +195,7 @@ body {
   font: 600 12px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
+  text-overflow: clip;
 }
 
 .fz-mode-btn.fz-active {
@@ -206,21 +206,32 @@ body {
 
 .fz-pane-actions {
   display: flex;
-  flex: 0 1 auto;
+  flex: 0 0 auto;
   align-items: center;
   gap: 4px;
-  min-width: 0;
+  min-width: max-content;
   margin-left: auto;
 }
 
-.fz-lock-btn {
-  flex: 0 1 auto;
+.fz-lock-btn,
+.fz-type-btn {
+  flex: 0 0 28px;
   width: 28px;
   min-width: 28px;
   height: 28px;
   padding: 0;
   font-size: 13px;
   line-height: 1;
+}
+
+.fz-type-btn {
+  font-size: 15px;
+}
+
+.fz-type-btn.fz-active {
+  border-color: rgba(20, 86, 240, 0.55);
+  background: #eef3ff;
+  color: #1456f0;
 }
 
 .fz-content {
@@ -308,6 +319,62 @@ body {
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.fz-type-wrap {
+  position: relative;
+  display: flex;
+  min-height: calc(100% - 28px);
+  padding-bottom: 44px;
+}
+
+.fz-type-editor {
+  flex: 1;
+  width: 100%;
+  min-height: 100%;
+  resize: none;
+  padding: 10px 11px;
+  border: 1px solid rgba(20, 86, 240, 0.28);
+  border-radius: 6px;
+  outline: none;
+  background: #ffffff;
+  color: #1f2329;
+  font: 12px/1.55 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap;
+}
+
+.fz-type-editor:focus {
+  border-color: rgba(20, 86, 240, 0.72);
+  box-shadow: 0 0 0 2px rgba(20, 86, 240, 0.12);
+}
+
+.fz-type-actions {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  display: flex;
+  justify-content: flex-end;
+  pointer-events: none;
+}
+
+.fz-complete-btn {
+  min-width: 54px;
+  height: 28px;
+  border-color: #1456f0;
+  background: #1456f0;
+  color: #ffffff;
+  pointer-events: auto;
+}
+
+.fz-complete-btn:hover {
+  color: #ffffff;
+}
+
+.fz-complete-btn:disabled {
+  border-color: rgba(31, 35, 41, 0.14);
+  background: #eff1f5;
+  color: #8f959e;
+  cursor: default;
 }
 
 .fz-toast {
@@ -414,10 +481,12 @@ body {
   }
 
   .fz-mode-btn {
-    padding: 0 5px;
+    padding: 0 2px;
   }
 
-  .fz-lock-btn {
+  .fz-lock-btn,
+  .fz-type-btn {
+    flex-basis: 24px;
     width: 24px;
     min-width: 24px;
   }

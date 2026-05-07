@@ -10,8 +10,8 @@
     splitRatio: 50,
     activePane: 0,
     panes: [
-      { locked: false, mode: "auto", text: "", source: "分栏 1", cellContext: null, cellAddress: "" },
-      { locked: false, mode: "auto", text: "", source: "分栏 2", cellContext: null, cellAddress: "" }
+      { locked: false, mode: "auto", text: "", source: "分栏 1", cellContext: null, cellAddress: "", editing: false, draft: "", writing: false, editContext: null, editAddress: "" },
+      { locked: false, mode: "auto", text: "", source: "分栏 2", cellContext: null, cellAddress: "", editing: false, draft: "", writing: false, editContext: null, editAddress: "" }
     ],
     debug: {
       open: false,
@@ -33,8 +33,7 @@
 
   document.addEventListener("click", (event) => {
     const isPaneControlClick = Boolean(event.target.closest("[data-mode],[data-action]"));
-    const contentEl = event.target.closest(".fz-content");
-    const isTextContentClick = Boolean(contentEl && !event.target.closest(".fz-empty"));
+    const isTextContentClick = Boolean(event.target.closest(".fz-rendered,.fz-json,.fz-raw,.fz-type-editor"));
     const paneEl = event.target.closest(".fz-pane");
     if (paneEl && !isPaneControlClick && !isTextContentClick) {
       const paneIndex = Number(paneEl.dataset.pane);
@@ -54,6 +53,7 @@
       const modePaneEl = modeBtn.closest(".fz-pane");
       if (!modePaneEl) return;
       const paneIndex = Number(modePaneEl.dataset.pane);
+      exitTypingMode(paneIndex);
       state.panes[paneIndex].mode = modeBtn.dataset.mode;
       renderPane(paneIndex, { preserveScroll: true });
       return;
@@ -63,12 +63,32 @@
     if (!actionBtn) return;
     const action = actionBtn.dataset.action;
 
+    if (action === "complete-typing") {
+      const paneElForWrite = actionBtn.closest(".fz-pane");
+      if (!paneElForWrite) return;
+      completeTypingMode(Number(paneElForWrite.dataset.pane));
+      return;
+    }
+
+    if (action === "type") {
+      const typePaneEl = actionBtn.closest(".fz-pane");
+      if (!typePaneEl) return;
+      const paneIndex = Number(typePaneEl.dataset.pane);
+      if (state.panes[paneIndex] && state.panes[paneIndex].editing) {
+        cancelTypingMode(paneIndex);
+      } else {
+        beginTypingMode(paneIndex);
+      }
+      return;
+    }
+
     if (action === "lock") {
       const lockPaneEl = actionBtn.closest(".fz-pane");
       if (!lockPaneEl) return;
       const paneIndex = Number(lockPaneEl.dataset.pane);
       const wasLocked = state.panes[paneIndex].locked;
       state.panes[paneIndex].locked = !state.panes[paneIndex].locked;
+      exitTypingMode(paneIndex);
       state.activePane = paneIndex;
       renderPane(paneIndex, { preserveScroll: true });
       renderChrome();
@@ -78,6 +98,7 @@
     }
 
     if (action === "split-single") {
+      exitAllTypingModes();
       state.split = "single";
       state.activePane = 0;
       renderAll();
@@ -85,12 +106,14 @@
     }
 
     if (action === "split-vertical") {
+      exitAllTypingModes();
       state.split = "vertical";
       renderAll();
       return;
     }
 
     if (action === "split-horizontal") {
+      exitAllTypingModes();
       state.split = "horizontal";
       renderAll();
       return;
@@ -114,6 +137,28 @@
       renderDebug();
       showToast("已清空调试记录");
     }
+  });
+
+  document.addEventListener("input", (event) => {
+    const editor = event.target.closest(".fz-type-editor");
+    if (!editor) return;
+    const paneEl = editor.closest(".fz-pane");
+    if (!paneEl) return;
+    const paneIndex = Number(paneEl.dataset.pane);
+    const pane = state.panes[paneIndex];
+    if (!pane) return;
+    pane.draft = editor.value;
+    updateTypingCount(paneEl, pane.draft);
+  });
+
+  document.addEventListener("keydown", (event) => {
+    const editor = event.target.closest(".fz-type-editor");
+    if (!editor) return;
+    if (event.key !== "Enter" || event.shiftKey || event.altKey || event.isComposing) return;
+    const paneEl = editor.closest(".fz-pane");
+    if (!paneEl) return;
+    event.preventDefault();
+    completeTypingMode(Number(paneEl.dataset.pane));
   });
 
   splitterEl.addEventListener("pointerdown", startSplitResize);
@@ -161,9 +206,7 @@
       state.debug.logs.length = MAX_DEBUG_LOGS;
     }
 
-    if (normalized.finalResult.status !== "success" && !state.debug.open) {
-      state.debug.alert = true;
-    }
+    state.debug.alert = false;
     renderDebug();
   }
 
@@ -219,6 +262,7 @@
 
     state.activePane = paneIndex;
     const pane = state.panes[paneIndex];
+    if (pane.editing) exitTypingMode(paneIndex);
     pane.text = text;
     pane.source = source;
     pane.cellContext = cellContext || pane.cellContext;
@@ -226,6 +270,146 @@
     renderChrome();
     renderPane(paneIndex, { preserveScroll: false });
     renderDebug();
+  }
+
+  function beginTypingMode(paneIndex) {
+    const pane = state.panes[paneIndex];
+    if (!pane) return;
+    const context = pane.cellContext;
+    if (!context) {
+      showToast("暂无可写入单元格");
+      return;
+    }
+    pane.editing = true;
+    pane.writing = false;
+    pane.mode = "auto";
+    pane.draft = pane.text || "";
+    pane.editContext = context;
+    pane.editAddress = pane.cellAddress || "";
+    state.activePane = paneIndex;
+    renderChrome();
+    renderPane(paneIndex, { preserveScroll: false, focusEditor: true });
+  }
+
+  function exitTypingMode(paneIndex) {
+    const pane = state.panes[paneIndex];
+    if (!pane || !pane.editing) return;
+    pane.editing = false;
+    pane.writing = false;
+    pane.mode = "auto";
+    pane.draft = "";
+    pane.editContext = null;
+    pane.editAddress = "";
+  }
+
+  function cancelTypingMode(paneIndex) {
+    const pane = state.panes[paneIndex];
+    if (!pane || !pane.editing) return;
+    exitTypingMode(paneIndex);
+    state.activePane = paneIndex;
+    renderChrome();
+    renderPane(paneIndex, { preserveScroll: false });
+    if (!pane.locked) requestInitialCapture();
+  }
+
+  function exitAllTypingModes() {
+    state.panes.forEach((pane, index) => {
+      if (pane && pane.editing) exitTypingMode(index);
+    });
+  }
+
+  async function completeTypingMode(paneIndex) {
+    const pane = state.panes[paneIndex];
+    if (!pane || !pane.editing || pane.writing) return;
+    if (!pane.editContext) {
+      showToast("暂无可写入单元格");
+      return;
+    }
+
+    pane.writing = true;
+    renderPane(paneIndex, { preserveScroll: true });
+
+    const clipboardPrime = await prepareClipboardForWrite(pane.draft);
+    const payload = {
+      type: "FZ_WRITE_CELL",
+      text: pane.draft,
+      cellContext: pane.editContext,
+      cellAddress: pane.editAddress,
+      paneIndex,
+      clipboardPrimed: Boolean(clipboardPrime.ok),
+      clipboardPrime
+    };
+
+    let result;
+    try {
+      result = chrome.runtime.sendMessage(payload, (response) => {
+        const error = chrome.runtime.lastError;
+        handleWriteResponse(paneIndex, error ? { ok: false, reason: error.message } : response);
+      });
+      if (result && typeof result.catch === "function") {
+        result.then((response) => handleWriteResponse(paneIndex, response)).catch((error) => {
+          handleWriteResponse(paneIndex, { ok: false, reason: error && error.message ? error.message : "WRITE_MESSAGE_FAILED" });
+        });
+      }
+    } catch (error) {
+      handleWriteResponse(paneIndex, { ok: false, reason: error && error.message ? error.message : "WRITE_MESSAGE_FAILED" });
+    }
+  }
+
+  function handleWriteResponse(paneIndex, response) {
+    const pane = state.panes[paneIndex];
+    if (!pane) return;
+    if (!pane.editing && !pane.writing) return;
+    if (!response || !response.ok) {
+      pane.writing = false;
+      renderPane(paneIndex, { preserveScroll: true, focusEditor: true });
+      showToast(`写入失败：${response && response.reason ? response.reason : "未知错误"}`);
+      return;
+    }
+
+    pane.text = pane.draft;
+    pane.mode = "auto";
+    pane.cellContext = pane.editContext || pane.cellContext;
+    pane.cellAddress = pane.editAddress || pane.cellAddress;
+    exitTypingMode(paneIndex);
+    renderPane(paneIndex, { preserveScroll: false });
+    showToast("回写完成");
+  }
+
+  async function prepareClipboardForWrite(text) {
+    const clipboardText = makeSingleCellClipboardText(text);
+    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+      return {
+        ok: false,
+        reason: "clipboard_api_missing",
+        textLength: clipboardText.length
+      };
+    }
+
+    try {
+      await navigator.clipboard.writeText(clipboardText);
+      return {
+        ok: true,
+        reason: "clipboard_prepared",
+        textLength: clipboardText.length
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: error && error.message ? error.message : "clipboard_prepare_failed",
+        textLength: clipboardText.length
+      };
+    }
+  }
+
+  function makeSingleCellClipboardText(text) {
+    const normalized = normalizeWriteText(text);
+    if (!/[\t\n"]/.test(normalized)) return normalized;
+    return `"${normalized.replace(/"/g, '""')}"`;
+  }
+
+  function normalizeWriteText(text) {
+    return String(text == null ? "" : text).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   }
 
   function requestInitialCapture() {
@@ -272,7 +456,9 @@
     const paneEl = document.querySelector(`[data-pane="${index}"]`);
     const contentEl = paneEl.querySelector(".fz-content");
     const lockBtn = paneEl.querySelector('[data-action="lock"]');
+    const typeBtn = paneEl.querySelector('[data-action="type"]');
     const preserveScroll = Boolean(options && options.preserveScroll);
+    const focusEditor = Boolean(options && options.focusEditor);
     const scrollTop = contentEl.scrollTop;
     const scrollLeft = contentEl.scrollLeft;
 
@@ -280,6 +466,10 @@
     lockBtn.textContent = pane.locked ? "🔒" : "🔓";
     lockBtn.title = pane.locked ? "点击解锁" : "点击锁定";
     lockBtn.setAttribute("aria-label", lockBtn.title);
+    if (typeBtn) {
+      typeBtn.classList.toggle("fz-active", pane.editing);
+      typeBtn.disabled = pane.writing;
+    }
 
     paneEl.querySelectorAll("[data-mode]").forEach((btn) => {
       btn.classList.toggle("fz-active", btn.dataset.mode === pane.mode);
@@ -297,17 +487,30 @@
       contentEl.scrollTop = 0;
       contentEl.scrollLeft = 0;
     }
+    if (focusEditor) {
+      const editor = contentEl.querySelector(".fz-type-editor");
+      if (editor) {
+        editor.focus();
+        editor.selectionStart = editor.value.length;
+        editor.selectionEnd = editor.value.length;
+      }
+    }
   }
 
   function renderPaneContent(pane) {
     const address = pane.cellAddress || "";
-    const count = countCellText(pane.text || "");
+    const displayText = pane.editing ? pane.draft : pane.text;
+    const count = countCellText(displayText || "");
     const meta = [
       '<div class="fz-cell-meta">',
       `<span class="fz-cell-address">${address ? escapeHtml(address) : ""}</span>`,
       `<span class="fz-cell-count">${count} 字</span>`,
       "</div>"
     ].join("");
+
+    if (pane.editing) {
+      return `${meta}${renderTypingEditor(pane)}`;
+    }
 
     if (!pane.text) {
       return `${meta}<div class="fz-empty">单击单元格展示内容</div>`;
@@ -316,11 +519,27 @@
     return `${meta}${renderContent(pane.text, pane.mode)}`;
   }
 
+  function renderTypingEditor(pane) {
+    return [
+      '<div class="fz-type-wrap">',
+      `<textarea class="fz-type-editor" spellcheck="false">${escapeHtml(pane.draft || "")}</textarea>`,
+      '<div class="fz-type-actions">',
+      `<button class="fz-btn fz-complete-btn" data-action="complete-typing"${pane.writing ? " disabled" : ""}>${pane.writing ? "写入中" : "完成"}</button>`,
+      "</div>",
+      "</div>"
+    ].join("");
+  }
+
+  function updateTypingCount(paneEl, text) {
+    const countEl = paneEl.querySelector(".fz-cell-count");
+    if (countEl) countEl.textContent = `${countCellText(text || "")} 字`;
+  }
+
   function renderDebug() {
     debugToggleEl.setAttribute("aria-expanded", state.debug.open ? "true" : "false");
     debugPanelEl.hidden = !state.debug.open;
-    debugAlertDotEl.hidden = !state.debug.alert;
-    debugSectionEl.classList.toggle("fz-debug-alert", state.debug.alert);
+    debugAlertDotEl.hidden = true;
+    debugSectionEl.classList.remove("fz-debug-alert");
     debugCountEl.textContent = `最近 ${state.debug.logs.length} 条`;
 
     if (!state.debug.logs.length) {

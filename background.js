@@ -1,5 +1,5 @@
 let lastFeishuTabId = null;
-const AUTO_CAPTURE_DELAY_MS = 120;
+const AUTO_CAPTURE_DELAY_MS = 60;
 const INJECT_DEBOUNCE_MS = 300;
 const injectedAtByTab = new Map();
 
@@ -41,8 +41,15 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   });
 });
 
-chrome.runtime.onMessage.addListener((message, sender) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== "string") return;
+
+  if (message.type === "FZ_WRITE_CELL") {
+    forwardWriteCell(message).then(sendResponse).catch((error) => {
+      sendResponse({ ok: false, reason: error && error.message ? error.message : "WRITE_FORWARD_FAILED" });
+    });
+    return true;
+  }
 
   if (message.type === "FZ_PANEL_READY") {
     if (typeof lastFeishuTabId === "number") {
@@ -58,6 +65,17 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     lastFeishuTabId = sender.tab.id;
   }
 });
+
+async function forwardWriteCell(message) {
+  if (typeof lastFeishuTabId !== "number") return { ok: false, reason: "NO_FEISHU_TAB" };
+  const injected = await ensureContentScript(lastFeishuTabId);
+  if (!injected) return { ok: false, reason: "CONTENT_SCRIPT_NOT_READY" };
+  try {
+    return await chrome.tabs.sendMessage(lastFeishuTabId, message);
+  } catch (error) {
+    return { ok: false, reason: error && error.message ? error.message : "WRITE_MESSAGE_FAILED" };
+  }
+}
 
 async function ensureContentScript(tabId, options = {}) {
   if (typeof tabId !== "number") return false;
