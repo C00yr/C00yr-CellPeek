@@ -112,7 +112,7 @@
     for (const probe of probes) {
       const raw = safelyRunProbe(probe.run);
       const text = normalizeCellText(raw);
-      const evaluation = evaluateCandidate(text, probe.key);
+      const evaluation = evaluateCandidate(text, probe.key, session.cellAddress);
 
       pushAttempt(session, {
         step: stepIndex + 1,
@@ -950,12 +950,19 @@
     return bestText;
   }
 
-  function evaluateCandidate(text, sourceKey) {
+  function evaluateCandidate(text, sourceKey, cellAddress) {
     if (!text) return { status: "reject", reason: "empty" };
     if (isBlockedText(text)) return { status: "blocked", reason: "blocked_text" };
-    if (sourceKey && sourceKey.startsWith("formula") && isLikelyCellAddressToken(text)) return { status: "reject", reason: "cell_address_token" };
+    if (sourceKey && sourceKey.startsWith("formula") && isCurrentCellAddressToken(text, cellAddress)) return { status: "reject", reason: "cell_address_token" };
     if (!isUsefulText(text)) return { status: "reject", reason: "not_useful" };
     return { status: "success", reason: "ok" };
+  }
+
+  function isCurrentCellAddressToken(text, cellAddress) {
+    const value = normalizeCellAddress(text);
+    if (!value) return false;
+    const current = normalizeCellAddress(cellAddress);
+    return Boolean(current && value === current);
   }
 
   function isLikelyCellAddressToken(text) {

@@ -32,13 +32,21 @@
   const debugContentEl = document.querySelector(".fz-debug-content");
 
   document.addEventListener("click", (event) => {
+    const isPaneControlClick = Boolean(event.target.closest("[data-mode],[data-action]"));
+    const contentEl = event.target.closest(".fz-content");
+    const isTextContentClick = Boolean(contentEl && !event.target.closest(".fz-empty"));
     const paneEl = event.target.closest(".fz-pane");
-    if (paneEl) {
+    if (paneEl && !isPaneControlClick && !isTextContentClick) {
       const paneIndex = Number(paneEl.dataset.pane);
-      const paneChanged = Number.isFinite(paneIndex) && paneIndex !== state.activePane;
-      state.activePane = paneIndex;
-      renderChrome();
-      if (paneChanged) requestInitialCapture();
+      if (Number.isFinite(paneIndex)) {
+        state.activePane = paneIndex;
+        renderChrome();
+        if (state.panes[paneIndex].locked) {
+          showToast("该分栏已锁定");
+        } else {
+          requestInitialCapture();
+        }
+      }
     }
 
     const modeBtn = event.target.closest("[data-mode]");
@@ -59,8 +67,12 @@
       const lockPaneEl = actionBtn.closest(".fz-pane");
       if (!lockPaneEl) return;
       const paneIndex = Number(lockPaneEl.dataset.pane);
+      const wasLocked = state.panes[paneIndex].locked;
       state.panes[paneIndex].locked = !state.panes[paneIndex].locked;
+      state.activePane = paneIndex;
       renderPane(paneIndex, { preserveScroll: true });
+      renderChrome();
+      if (wasLocked) requestInitialCapture();
       showToast(state.panes[paneIndex].locked ? "已锁定当前分栏" : "已解锁当前分栏");
       return;
     }
