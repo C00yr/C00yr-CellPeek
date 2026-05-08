@@ -9,6 +9,7 @@
     split: "single",
     splitRatio: 50,
     activePane: 0,
+    scope: readPanelScopeFromUrl(),
     panes: [
       { locked: false, mode: "auto", text: "", source: "分栏 1", cellContext: null, cellAddress: "", editing: false, draft: "", writing: false, editContext: null, editAddress: "" },
       { locked: false, mode: "auto", text: "", source: "分栏 2", cellContext: null, cellAddress: "", editing: false, draft: "", writing: false, editContext: null, editAddress: "" }
@@ -165,6 +166,12 @@
 
   chrome.runtime.onMessage.addListener((message) => {
     if (!message) return;
+    if (!isRoutedForThisPanel(message)) return;
+
+    if (message.type === "FZ_PANEL_SCOPE_CHANGED") {
+      updatePanelScope(message);
+      return;
+    }
 
     if (message.type === "FZ_CAPTURE_DEBUG") {
       pushDebugLog(message.debug || {});
@@ -192,12 +199,17 @@
       message.text || "",
       message.source || "点击的单元格",
       message.cellContext || null,
-      message.cellAddress || ""
+      message.cellAddress || "",
+      {
+        tabId: message.tabId,
+        windowId: message.windowId,
+        frameId: message.frameId
+      }
     );
   });
 
-  requestInitialCapture();
   renderAll();
+  initPanelScope().then(() => requestInitialCapture()).catch(() => requestInitialCapture());
 
   function pushDebugLog(log) {
     const normalized = normalizeDebugLog(log);
@@ -253,7 +265,7 @@
     });
   }
 
-  function writeToActivePane(text, source, cellContext, cellAddress) {
+  function writeToActivePane(text, source, cellContext, cellAddress, scope) {
     const paneIndex = getWritablePaneIndex();
     if (paneIndex === -1) {
       showToast("两个分栏都已锁定");
@@ -267,6 +279,10 @@
     pane.source = source;
     pane.cellContext = cellContext || pane.cellContext;
     pane.cellAddress = normalizeCellAddress(cellAddress);
+    pane.cellTabId = toFiniteNumber(scope && scope.tabId);
+    pane.cellWindowId = toFiniteNumber(scope && scope.windowId);
+    pane.cellFrameId = toFiniteNumber(scope && scope.frameId);
+    updatePanelScope(scope);
     renderChrome();
     renderPane(paneIndex, { preserveScroll: false });
     renderDebug();
@@ -280,12 +296,19 @@
       showToast("暂无可写入单元格");
       return;
     }
+    if (isPaneFromInactiveTab(pane)) {
+      showToast("该内容来自其他标签页，请切回原标签页后再键入");
+      return;
+    }
     pane.editing = true;
     pane.writing = false;
     pane.mode = "auto";
     pane.draft = pane.text || "";
     pane.editContext = context;
     pane.editAddress = pane.cellAddress || "";
+    pane.editTabId = pane.cellTabId;
+    pane.editWindowId = pane.cellWindowId;
+    pane.editFrameId = pane.cellFrameId;
     state.activePane = paneIndex;
     renderChrome();
     renderPane(paneIndex, { preserveScroll: false, focusEditor: true });
@@ -300,6 +323,9 @@
     pane.draft = "";
     pane.editContext = null;
     pane.editAddress = "";
+    pane.editTabId = null;
+    pane.editWindowId = null;
+    pane.editFrameId = null;
   }
 
   function cancelTypingMode(paneIndex) {
@@ -335,6 +361,9 @@
       text: pane.draft,
       cellContext: pane.editContext,
       cellAddress: pane.editAddress,
+      tabId: pane.editTabId || state.scope.tabId || null,
+      windowId: pane.editWindowId || state.scope.windowId || null,
+      frameId: pane.editFrameId || null,
       paneIndex,
       clipboardPrimed: Boolean(clipboardPrime.ok),
       clipboardPrime
@@ -371,6 +400,9 @@
     pane.mode = "auto";
     pane.cellContext = pane.editContext || pane.cellContext;
     pane.cellAddress = pane.editAddress || pane.cellAddress;
+    pane.cellTabId = pane.editTabId || pane.cellTabId;
+    pane.cellWindowId = pane.editWindowId || pane.cellWindowId;
+    pane.cellFrameId = pane.editFrameId || pane.cellFrameId;
     exitTypingMode(paneIndex);
     renderPane(paneIndex, { preserveScroll: false });
     showToast("回写完成");
@@ -414,9 +446,57 @@
 
   function requestInitialCapture() {
     try {
-      const result = chrome.runtime.sendMessage({ type: "FZ_PANEL_READY" });
+      const result = chrome.runtime.sendMessage({
+        type: "FZ_PANEL_READY",
+        tabId: state.scope.tabId || null,
+        windowId: state.scope.windowId || null
+      });
       if (result && typeof result.catch === "function") result.catch(() => {});
     } catch (_) {}
+  }
+
+  async function initPanelScope() {
+    if (state.scope.windowId) return;
+    if (!chrome.windows || typeof chrome.windows.getCurrent !== "function") return;
+    try {
+      const currentWindow = await chrome.windows.getCurrent();
+      if (currentWindow && typeof currentWindow.id === "number") {
+        state.scope.windowId = currentWindow.id;
+      }
+    } catch (_) {}
+  }
+
+  function readPanelScopeFromUrl() {
+    const params = new URLSearchParams(location.search || "");
+    const tabId = toFiniteNumber(params.get("tabId"));
+    return {
+      tabId,
+      activeTabId: tabId,
+      windowId: toFiniteNumber(params.get("windowId"))
+    };
+  }
+
+  function isRoutedForThisPanel(message) {
+    if (!message || !message.fzRouted) return false;
+    const messageWindowId = toFiniteNumber(message.windowId);
+    if (!state.scope.windowId || !messageWindowId) return true;
+    return state.scope.windowId === messageWindowId;
+  }
+
+  function updatePanelScope(scope) {
+    const tabId = toFiniteNumber(scope && scope.tabId);
+    const windowId = toFiniteNumber(scope && scope.windowId);
+    if (tabId) {
+      state.scope.activeTabId = tabId;
+      state.scope.tabId = tabId;
+    }
+    if (windowId) state.scope.windowId = windowId;
+  }
+
+  function isPaneFromInactiveTab(pane) {
+    const paneTabId = toFiniteNumber(pane && pane.cellTabId);
+    const activeTabId = toFiniteNumber(state.scope.activeTabId || state.scope.tabId);
+    return Boolean(paneTabId && activeTabId && paneTabId !== activeTabId);
   }
 
   function getWritablePaneIndex() {
@@ -624,6 +704,11 @@
     const text = String(value || "").trim().toUpperCase();
     const match = text.match(/^\$?([A-Z]{1,4})\$?(\d{1,7})$/);
     return match ? `${match[1]}${match[2]}` : "";
+  }
+
+  function toFiniteNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
   }
 
   function renderContent(text, mode) {

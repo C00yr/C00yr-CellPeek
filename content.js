@@ -242,8 +242,11 @@
     const context = normalizeCellContext(message.cellContext) || lastCellContext;
 
     if (context) {
-      focusCellByPoint(context);
+      const focusResult = focusCellByPointDetailed(context);
+      if (!focusResult || !focusResult.ok) return { ok: false, reason: "TARGET_CELL_FOCUS_FAILED" };
       await sleep(24);
+    } else {
+      return { ok: false, reason: "MISSING_CELL_CONTEXT" };
     }
 
     const editor = findWriteTargetEditor(context);
@@ -275,8 +278,9 @@
       }
     });
 
+    let focusResult = null;
     if (context) {
-      const focusResult = focusCellByPointDetailed(context);
+      focusResult = focusCellByPointDetailed(context);
       pushWriteAttempt(debugSession, {
         step: step++,
         source: "定位并激活单元格",
@@ -309,6 +313,27 @@
       candidateText: extractEditableText(activeAfterFocus),
       details: { activeElement: describeElementForDebug(activeAfterFocus) }
     });
+
+    if (!context || (focusResult && !focusResult.ok)) {
+      pushWriteAttempt(debugSession, {
+        step: step++,
+        source: "中止写回",
+        hit: false,
+        reason: !context ? "missing_cell_context" : "target_cell_focus_failed",
+        candidateText: "",
+        details: {
+          focusResult,
+          requestedContext,
+          cachedContext: lastCellContext || null
+        }
+      });
+      emitWriteDebugSession(debugSession, "error", !context ? "MISSING_CELL_CONTEXT" : "TARGET_CELL_FOCUS_FAILED");
+      return {
+        ok: false,
+        reason: !context ? "MISSING_CELL_CONTEXT" : "TARGET_CELL_FOCUS_FAILED",
+        debugSessionId: debugSession.id
+      };
+    }
 
     const pasteResult = await runPasteWriteStrategy(text, context);
     pushWriteAttempt(debugSession, {
@@ -1259,6 +1284,15 @@
     if (context) {
       const focusResult = focusCellByPointDetailed(context);
       actions.push({ action: "focus_cell", ...focusResult });
+      if (!focusResult || !focusResult.ok) {
+        return {
+          ok: false,
+          reason: "target_cell_focus_failed",
+          observedFormula: normalizeCellText(probeFormulaBarText()),
+          actions,
+          observations
+        };
+      }
       await sleep(35);
     }
 
