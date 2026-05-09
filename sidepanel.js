@@ -355,7 +355,10 @@
     pane.writing = true;
     renderPane(paneIndex, { preserveScroll: true });
 
-    const clipboardPrime = await prepareClipboardForWrite(pane.draft);
+    const shouldPrimeClipboard = normalizeWriteText(pane.draft) !== "";
+    const clipboardPrime = shouldPrimeClipboard
+      ? await prepareClipboardForWrite(pane.draft)
+      : { ok: false, reason: "skip_empty_write", textLength: 0 };
     const payload = {
       type: "FZ_WRITE_CELL",
       text: pane.draft,
@@ -365,7 +368,7 @@
       windowId: pane.editWindowId || state.scope.windowId || null,
       frameId: pane.editFrameId || null,
       paneIndex,
-      clipboardPrimed: Boolean(clipboardPrime.ok),
+      clipboardPrimed: shouldPrimeClipboard && Boolean(clipboardPrime.ok),
       clipboardPrime
     };
 

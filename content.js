@@ -335,6 +335,34 @@
       };
     }
 
+    const isClearingCell = isClearWriteText(text);
+    if (isClearingCell) {
+      const clearResult = await runClearCellStrategy(context);
+      pushWriteAttempt(debugSession, {
+        step: step++,
+        source: "clear_cell_strategy",
+        hit: Boolean(clearResult && clearResult.ok),
+        reason: clearResult && clearResult.reason ? clearResult.reason : "unknown",
+        candidateText: clearResult && typeof clearResult.observedFormula === "string" ? clearResult.observedFormula : "",
+        details: clearResult
+      });
+
+      if (clearResult && clearResult.ok) {
+        emitCellSelected(text, "clear_cell", context);
+        pushWriteAttempt(debugSession, {
+          step: step++,
+          source: "panel_preview",
+          hit: true,
+          reason: "sent_after_clear",
+          candidateText: text,
+          details: { source: "clear_cell" }
+        });
+        emitWriteDebugSession(debugSession, "success", "clear_ok");
+        return { ok: true, debugSessionId: debugSession.id, writeStrategy: "clear" };
+      }
+    }
+
+    if (!isClearingCell) {
     const pasteResult = await runPasteWriteStrategy(text, context);
     pushWriteAttempt(debugSession, {
       step: step++,
@@ -402,6 +430,8 @@
         writeStrategy: "native_paste_pending_lark_sync",
         pendingVerification: true
       };
+    }
+
     }
 
     const editorSelection = findWriteTargetEditorDetailed(context);
@@ -1136,6 +1166,10 @@
     }
     if (isContentEditableElement(editor)) {
       selectAllContent(editor);
+      if (isClearWriteText(text)) {
+        clearContentEditable(editor);
+        return;
+      }
       try {
         editor.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertReplacementText", data: text }));
       } catch (_) {}
@@ -1147,6 +1181,26 @@
       editor.dispatchEvent(new Event("input", { bubbles: true }));
       editor.dispatchEvent(new Event("change", { bubbles: true }));
     }
+  }
+
+  function clearContentEditable(editor) {
+    try {
+      editor.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "deleteContentBackward", data: null }));
+    } catch (_) {}
+    let cleared = false;
+    try {
+      cleared = typeof document.execCommand === "function" && document.execCommand("delete", false, null);
+    } catch (_) {
+      cleared = false;
+    }
+    if (!cleared || extractEditableText(editor)) {
+      editor.textContent = "";
+    }
+    try {
+      editor.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: false, inputType: "deleteContentBackward", data: null }));
+    } catch (_) {}
+    editor.dispatchEvent(new Event("input", { bubbles: true }));
+    editor.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
   function setEditorTextDetailed(editor, text) {
@@ -1232,15 +1286,16 @@
         ...dispatchResult
       });
 
-      await sleep(80);
-      const observedFormula = normalizeCellText(probeFormulaBarText());
-      const observedActive = normalizeCellText(extractEditableText(resolveEditableRoot(getDeepActiveElement())));
-      const matched = observedFormula === normalizedTarget;
+      const pasteVerification = await waitForFormulaMatch(normalizedTarget, [30, 70]);
+      const observedFormula = pasteVerification.observedFormula;
+      const observedActive = pasteVerification.observedActive;
+      const matched = Boolean(pasteVerification.ok);
       observations.push({
         index,
         observedFormula,
         observedActive,
-        matched
+        matched,
+        checks: pasteVerification.checks
       });
 
       if (matched) {
@@ -1262,6 +1317,44 @@
       clipboardTextSample: sampleText(clipboardText),
       dispatches,
       observations
+    };
+  }
+
+  async function waitForFormulaMatch(normalizedTarget, waits) {
+    const checks = [];
+    let observedFormula = "";
+    let observedActive = "";
+
+    for (let round = 0; round < waits.length; round += 1) {
+      await sleep(waits[round]);
+      observedFormula = normalizeCellText(probeFormulaBarText());
+      observedActive = normalizeCellText(extractEditableText(resolveEditableRoot(getDeepActiveElement())));
+      const matched = observedFormula === normalizedTarget;
+      checks.push({
+        round: round + 1,
+        waitMs: waits[round],
+        observedFormula,
+        observedActive,
+        matched
+      });
+
+      if (matched) {
+        return {
+          ok: true,
+          reason: "formula_matches_target",
+          observedFormula,
+          observedActive,
+          checks
+        };
+      }
+    }
+
+    return {
+      ok: false,
+      reason: "formula_not_matched",
+      observedFormula,
+      observedActive,
+      checks
     };
   }
 
@@ -1409,6 +1502,203 @@
       observedFormula: observations.length ? observations[observations.length - 1].observedFormula : normalizeCellText(probeFormulaBarText()),
       actions,
       observations
+    };
+  }
+
+  async function runClearCellStrategy(context) {
+    const actions = [];
+    const observations = [];
+
+    if (!context) {
+      return {
+        ok: false,
+        reason: "missing_cell_context",
+        observedFormula: normalizeCellText(probeFormulaBarText()),
+        actions,
+        observations
+      };
+    }
+
+    const directClear = await tryClearByKeyTargets(context, actions, observations, "direct_clear_key");
+    if (directClear) return directClear;
+
+    const focusResult = focusCellByPointDetailed(context);
+    actions.push({ action: "focus_cell_for_retry", ...focusResult });
+    if (focusResult && focusResult.ok) {
+      await sleep(35);
+      const focusedClear = await tryClearByKeyTargets(context, actions, observations, "focused_clear_key");
+      if (focusedClear) return focusedClear;
+    }
+
+    const editorSelection = findWriteTargetEditorDetailed(context);
+    if (editorSelection && editorSelection.editor) {
+      const beforeText = extractEditableText(editorSelection.editor);
+      const setResult = setEditorTextDetailed(editorSelection.editor, "");
+      const commitResult = commitEditorDetailed(editorSelection.editor);
+      actions.push({
+        action: "clear_editor",
+        setResult,
+        commitResult,
+        editor: describeElementForDebug(editorSelection.editor)
+      });
+      const verified = beforeText ? await verifyWritePersisted("", context, editorSelection.editor) : null;
+      observations.push({
+        action: "verify_editor_clear",
+        ok: Boolean(verified && verified.ok),
+        skipped: !beforeText,
+        details: verified || { reason: "skip_empty_editor_verification" }
+      });
+      if (verified && verified.ok) {
+        return {
+          ok: true,
+          reason: "editor_clear_persisted",
+          observedFormula: verified.observedFormula || "",
+          actions,
+          observations
+        };
+      }
+    }
+
+    return {
+      ok: false,
+      reason: "clear_not_persisted",
+      observedFormula: observations.length ? observations[observations.length - 1].observedFormula : normalizeCellText(probeFormulaBarText()),
+      actions,
+      observations
+    };
+  }
+
+  async function tryClearByKeyTargets(context, actions, observations, actionName) {
+    const targets = collectClearCommandTargets(context);
+    for (let index = 0; index < targets.length; index += 1) {
+      const target = targets[index];
+      for (const key of ["Delete"]) {
+        const dispatch = dispatchClearKey(target, key);
+        actions.push({
+          action: actionName,
+          index,
+          key,
+          target: describeEventTargetForDebug(target),
+          dispatch
+        });
+
+        const clearVerification = await verifyClearStably();
+        const observedFormula = clearVerification.observedFormula;
+        const observedActive = clearVerification.observedActive;
+        const matched = Boolean(clearVerification && clearVerification.ok);
+        observations.push({
+          index,
+          key,
+          observedFormula,
+          observedActive,
+          clearVerification,
+          matched
+        });
+
+        if (matched) {
+          return {
+            ok: true,
+            reason: "clear_key_persisted",
+            observedFormula,
+            actions,
+            observations
+          };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function collectClearCommandTargets(context) {
+    const targets = [];
+    const add = (target) => {
+      if (!target) return;
+      if (!(target instanceof EventTarget)) return;
+      if (targets.includes(target)) return;
+      targets.push(target);
+    };
+
+    if (context && Number.isFinite(context.x) && Number.isFinite(context.y)) {
+      const atPoint = document.elementFromPoint(context.x, context.y);
+      add(atPoint);
+      if (atPoint instanceof Element) {
+        add(atPoint.closest("canvas.faster-single-canvas"));
+      }
+    }
+
+    add(document.querySelector("canvas.faster-single-canvas"));
+    add(resolveEditableRoot(getDeepActiveElement()));
+    add(document.activeElement);
+    add(document.body);
+    add(document);
+    add(window);
+    return targets;
+  }
+
+  function dispatchClearKey(target, key) {
+    const dispatches = [];
+    const eventTarget = target instanceof EventTarget ? target : document;
+    try {
+      if (target instanceof Element && typeof target.focus === "function") target.focus();
+    } catch (_) {}
+    const isDelete = key === "Delete";
+    const init = {
+      bubbles: true,
+      cancelable: true,
+      key,
+      code: key,
+      keyCode: isDelete ? 46 : 8,
+      which: isDelete ? 46 : 8
+    };
+
+    ["keydown", "keypress", "keyup"].forEach((type) => {
+      try {
+        const dispatched = eventTarget.dispatchEvent(new KeyboardEvent(type, init));
+        dispatches.push({ type, dispatched });
+      } catch (error) {
+        dispatches.push({ type, dispatched: false, error: error && error.message ? error.message : "dispatch_failed" });
+      }
+    });
+
+    return dispatches;
+  }
+
+  async function verifyClearStably() {
+    const actions = [];
+    const waits = [45, 90];
+    let observedFormula = "";
+    let observedActive = "";
+
+    for (let index = 0; index < waits.length; index += 1) {
+      await sleep(waits[index]);
+      observedFormula = normalizeCellText(probeFormulaBarText());
+      observedActive = normalizeCellText(extractEditableText(resolveEditableRoot(getDeepActiveElement())));
+      actions.push({
+        action: "stable_read",
+        round: index + 1,
+        waitMs: waits[index],
+        observedFormula,
+        observedActive
+      });
+
+      if (observedFormula !== "") {
+        return {
+          ok: false,
+          reason: "formula_not_empty",
+          observedFormula,
+          observedActive,
+          actions
+        };
+      }
+    }
+
+    return {
+      ok: true,
+      reason: "formula_stably_empty",
+      observedFormula,
+      observedActive,
+      actions
     };
   }
 
@@ -1596,7 +1886,7 @@
 
   async function verifyWritePersisted(targetText, context, editor) {
     const normalizedTarget = normalizeCellText(targetText);
-    const checkpoints = [40, 120, 240, 520, 900, 1400];
+    const checkpoints = [35, 90, 180, 360, 700];
     const observations = [];
 
     for (let i = 0; i < checkpoints.length; i += 1) {
@@ -2139,6 +2429,10 @@
 
   function normalizeWriteText(value) {
     return String(value == null ? "" : value).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  }
+
+  function isClearWriteText(value) {
+    return normalizeWriteText(value) === "";
   }
 
   function normalizeCellContext(context) {
