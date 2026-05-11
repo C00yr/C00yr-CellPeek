@@ -234,6 +234,7 @@
       writeRequest: log.writeRequest && typeof log.writeRequest === "object" ? log.writeRequest : null,
       attempts: attempts.map((item) => ({
         step: Number(item.step || 0),
+        stage: item.stage || "",
         source: item.source || "",
         elapsedMs: Number(item.elapsedMs || 0),
         hit: Boolean(item.hit),
@@ -247,6 +248,7 @@
         chosenSource: log.finalResult && log.finalResult.chosenSource ? log.finalResult.chosenSource : "",
         reason: log.finalResult && log.finalResult.reason ? log.finalResult.reason : ""
       },
+      writePerformance: log.writePerformance && typeof log.writePerformance === "object" ? log.writePerformance : null,
       debugType: log.writeRequest ? "write" : "capture"
     };
   }
@@ -277,7 +279,7 @@
     if (pane.editing) exitTypingMode(paneIndex);
     pane.text = text;
     pane.source = source;
-    pane.cellContext = cellContext || pane.cellContext;
+    pane.cellContext = normalizePanelCellContext(cellContext);
     pane.cellAddress = normalizeCellAddress(cellAddress);
     pane.cellTabId = toFiniteNumber(scope && scope.tabId);
     pane.cellWindowId = toFiniteNumber(scope && scope.windowId);
@@ -291,9 +293,9 @@
   function beginTypingMode(paneIndex) {
     const pane = state.panes[paneIndex];
     if (!pane) return;
-    const context = pane.cellContext;
-    if (!context) {
-      showToast("暂无可写入单元格");
+    const context = normalizePanelCellContext(pane.cellContext);
+    if (!context || !isValidFrameId(pane.cellFrameId)) {
+      showToast("请先点击并展示一个单元格后再键入");
       return;
     }
     if (isPaneFromInactiveTab(pane)) {
@@ -347,8 +349,8 @@
   async function completeTypingMode(paneIndex) {
     const pane = state.panes[paneIndex];
     if (!pane || !pane.editing || pane.writing) return;
-    if (!pane.editContext) {
-      showToast("暂无可写入单元格");
+    if (!normalizePanelCellContext(pane.editContext) || !isValidFrameId(pane.editFrameId)) {
+      showToast("缺少单元格定位信息，请重新点击单元格");
       return;
     }
 
@@ -364,9 +366,15 @@
       text: pane.draft,
       cellContext: pane.editContext,
       cellAddress: pane.editAddress,
+      writeTargetMode: "typing_snapshot",
+      displayContext: pane.cellContext || null,
+      displayCellAddress: pane.cellAddress || "",
+      typingSnapshotContext: pane.editContext || null,
+      typingSnapshotAddress: pane.editAddress || "",
+      paneLocked: Boolean(pane.locked),
       tabId: pane.editTabId || state.scope.tabId || null,
       windowId: pane.editWindowId || state.scope.windowId || null,
-      frameId: pane.editFrameId || null,
+      frameId: pane.editFrameId == null ? null : pane.editFrameId,
       paneIndex,
       clipboardPrimed: shouldPrimeClipboard && Boolean(clipboardPrime.ok),
       clipboardPrime
@@ -445,6 +453,16 @@
 
   function normalizeWriteText(text) {
     return String(text == null ? "" : text).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  }
+
+  function normalizeDisplayText(text) {
+    return String(text == null ? "" : text)
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .replace(/\\r\\n/g, "\n")
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "\n")
+      .replace(/\\t/g, "\t");
   }
 
   function requestInitialCapture() {
@@ -583,7 +601,8 @@
   function renderPaneContent(pane) {
     const address = pane.cellAddress || "";
     const displayText = pane.editing ? pane.draft : pane.text;
-    const count = countCellText(displayText || "");
+    const countSource = pane.editing ? displayText : normalizeDisplayText(displayText || "");
+    const count = countCellText(countSource || "");
     const meta = [
       '<div class="fz-cell-meta">',
       `<span class="fz-cell-address">${address ? escapeHtml(address) : ""}</span>`,
@@ -709,25 +728,44 @@
     return match ? `${match[1]}${match[2]}` : "";
   }
 
+  function normalizePanelCellContext(context) {
+    if (!context || typeof context !== "object") return null;
+    const x = Number(context.x);
+    const y = Number(context.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    return { x: Math.round(x), y: Math.round(y) };
+  }
+
+  function isValidFrameId(frameId) {
+    return Number.isFinite(Number(frameId));
+  }
+
   function toFiniteNumber(value) {
     const number = Number(value);
     return Number.isFinite(number) ? number : null;
   }
 
   function renderContent(text, mode) {
-    const kind = mode === "auto" ? detectContentKind(text) : mode;
+    const rawText = String(text == null ? "" : text);
+    const displayText = normalizeDisplayText(rawText);
+    const rawJson = parseJson(rawText.trim());
+    let kind = mode;
+    if (mode === "auto") {
+      kind = rawJson.ok ? "json" : detectContentKind(displayText);
+    }
 
     if (kind === "json") {
-      const parsed = parseJson(text);
-      const pretty = parsed.ok ? JSON.stringify(parsed.value, null, 2) : text;
+      let parsed = parseJson(rawText);
+      if (!parsed.ok) parsed = parseJson(displayText);
+      const pretty = parsed.ok ? JSON.stringify(parsed.value, null, 2) : displayText;
       return `<pre class="fz-json">${linkify(escapeHtml(pretty))}</pre>`;
     }
 
     if (kind === "raw") {
-      return `<pre class="fz-raw">${linkify(escapeHtml(text))}</pre>`;
+      return `<pre class="fz-raw">${linkify(escapeHtml(rawText))}</pre>`;
     }
 
-    return `<div class="fz-rendered">${renderMarkdown(text)}</div>`;
+    return `<div class="fz-rendered">${renderMarkdown(displayText)}</div>`;
   }
 
   function detectContentKind(text) {
@@ -764,9 +802,9 @@
 
     text = renderTables(text);
     text = text
-      .replace(/^###\s+(.+)$/gm, "<h3>$1</h3>")
-      .replace(/^##\s+(.+)$/gm, "<h2>$1</h2>")
-      .replace(/^#\s+(.+)$/gm, "<h1>$1</h1>")
+      .replace(/^\s{0,3}###\s+(.+)$/gm, "<h3>$1</h3>")
+      .replace(/^\s{0,3}##\s+(.+)$/gm, "<h2>$1</h2>")
+      .replace(/^\s{0,3}#\s+(.+)$/gm, "<h1>$1</h1>")
       .replace(/^>\s?(.+)$/gm, "<blockquote>$1</blockquote>")
       .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
       .replace(/__(.+?)__/g, "<strong>$1</strong>")

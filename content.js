@@ -4,11 +4,13 @@
   if (window.__fzCellPreviewListenerInstalled) return;
   window.__fzCellPreviewListenerInstalled = true;
 
-  const RETRY_DELAYS = [0, 20, 50, 100, 200, 360];
-  const CAPTURE_TIMEOUT_MS = 650;
+  const RETRY_DELAYS = [0, 20, 50, 100, 200, 360, 520, 700];
+  const CAPTURE_TIMEOUT_MS = 850;
   const EARLY_EMPTY_MIN_STEP_INDEX = 2;
   const EARLY_EMPTY_REQUIRED_HITS = 2;
   const MAX_SEARCH_DEPTH = 10;
+  const KEYBOARD_CAPTURE_DELAY_MS = 80;
+  const FORMULA_CAPTURE_MIN_ACCEPT_MS = 200;
 
   const CELL_SELECTOR = "[role='gridcell'], [data-cell], [data-cell-id], td, th";
   const EDITOR_SELECTOR = "[contenteditable]:not([contenteditable='false']),textarea,input[type='text'],input:not([type]),[role='textbox']";
@@ -46,6 +48,8 @@
 
   let currentSession = null;
   let lastCellContext = null;
+  let lastCaptureResult = null;
+  let keyboardCaptureTimer = 0;
 
   document.addEventListener("click", (event) => {
     try {
@@ -57,6 +61,13 @@
       emitCaptureError(error, event && event.target instanceof Element ? event.target : null);
     }
   }, false);
+
+  document.addEventListener("keydown", (event) => {
+    try {
+      if (!event.isTrusted || !isCellNavigationKey(event)) return;
+      scheduleKeyboardFocusCapture();
+    } catch (_) {}
+  }, true);
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || typeof message.type !== "string") return;
@@ -97,6 +108,10 @@
 
     window.setTimeout(() => {
       if (!isSessionActive(session)) return;
+      if (session.sawStalePreviousFormula) {
+        finalizeSession(session, "success", "公式栏同步未完成");
+        return;
+      }
       if (!session.suppressEmpty) {
         emitCellSelected("", "空单元格", session.clickContext, session.cellAddress);
       }
@@ -112,18 +127,16 @@
     }
 
     const probes = [
-      { key: "formula", source: "公式栏输入区", run: probeFormulaBarText },
-      { key: "formulaVisible", source: "公式栏可见文本", run: () => probeVisibleFormulaBarText(session.clickContext) },
-      { key: "selected", source: "选中单元格标记", run: () => probeSelectedCellText(target) }
+      { key: "formula", source: "公式栏输入区", run: probeFormulaBarText }
     ];
 
-    let stepSelectedEmpty = false;
-    let stepFormulaStale = false;
+    let stepFormulaEmpty = false;
 
     for (const probe of probes) {
       const raw = safelyRunProbe(probe.run);
       const text = normalizeCellText(raw);
-      const evaluation = evaluateCandidate(text, probe.key, session.cellAddress);
+      const baseEvaluation = evaluateCandidate(text, probe.key, session.cellAddress);
+      const evaluation = refineFormulaCaptureEvaluation(session, probe.key, text, baseEvaluation);
 
       pushAttempt(session, {
         step: stepIndex + 1,
@@ -132,7 +145,8 @@
         hit: evaluation.status === "success",
         reason: evaluation.reason,
         candidateLength: text.length,
-        candidateSample: sampleText(text)
+        candidateSample: sampleText(text),
+        details: evaluation.details || null
       });
 
       if (evaluation.status === "blocked") {
@@ -141,19 +155,17 @@
         return;
       }
 
-      if (probe.key === "selected" && evaluation.reason === "empty") stepSelectedEmpty = true;
-      if (probe.key.startsWith("formula") && ["cell_address_token", "empty", "not_useful"].includes(evaluation.reason)) {
-        stepFormulaStale = true;
-      }
+      if (probe.key === "formula" && ["cell_address_token", "empty", "not_useful"].includes(evaluation.reason)) stepFormulaEmpty = true;
 
       if (evaluation.status !== "success") continue;
 
+      rememberCaptureResult(text, session.cellAddress);
       emitCellSelected(text, probe.source, session.clickContext, session.cellAddress);
       finalizeSession(session, "success", probe.source);
       return;
     }
 
-    if (stepSelectedEmpty && stepFormulaStale) {
+    if (stepFormulaEmpty) {
       session.emptyLikelyHits += 1;
     } else {
       session.emptyLikelyHits = 0;
@@ -169,14 +181,55 @@
 
   function captureCurrentActiveCell() {
     try {
-      const activeCell = findCurrentActiveCellElement();
-      const active = getDeepActiveElement();
-      const target = activeCell || (active instanceof Element ? active : document.body);
-      const context = activeCell ? getElementCenterContext(activeCell) : lastCellContext;
+      const focusTarget = resolveFocusedCellCaptureTarget();
+      const target = focusTarget.target || document.body;
+      const context = focusTarget.context || lastCellContext;
       startCaptureSession(target, null, context, { suppressEmpty: true });
     } catch (error) {
       emitCaptureError(error, document.body);
     }
+  }
+
+  function captureKeyboardFocusedCell() {
+    const focusTarget = resolveFocusedCellCaptureTarget();
+    if (!focusTarget.context && !focusTarget.target) return;
+    startCaptureSession(focusTarget.target || document.body, null, focusTarget.context || lastCellContext, { suppressEmpty: false });
+  }
+
+  function scheduleKeyboardFocusCapture() {
+    window.clearTimeout(keyboardCaptureTimer);
+    keyboardCaptureTimer = window.setTimeout(() => {
+      try {
+        captureKeyboardFocusedCell();
+      } catch (error) {
+        emitCaptureError(error, document.body);
+      }
+    }, KEYBOARD_CAPTURE_DELAY_MS);
+  }
+
+  function isCellNavigationKey(event) {
+    const key = event && event.key;
+    if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Tab", "Enter"].includes(key)) return false;
+    if (event.altKey || event.ctrlKey || event.metaKey) return false;
+    const active = getDeepActiveElement();
+    if (active instanceof Element && isFormulaEditorElement(active)) return false;
+    return true;
+  }
+
+  function resolveFocusedCellCaptureTarget() {
+    const activeCell = findCurrentActiveCellElement();
+    if (activeCell) {
+      return {
+        target: activeCell,
+        context: getElementCenterContext(activeCell)
+      };
+    }
+
+    const active = getDeepActiveElement();
+    const editable = resolveEditableRoot(active);
+    const target = editable instanceof Element ? editable : (active instanceof Element ? active : null);
+    const context = target instanceof Element ? getElementCenterContext(target) : null;
+    return { target, context };
   }
 
   function findCurrentActiveCellElement() {
@@ -239,7 +292,9 @@
 
   async function writeCellFromPanel(message) {
     const text = normalizeWriteText(message.text);
-    const context = normalizeCellContext(message.cellContext) || lastCellContext;
+    const context = normalizeCellContext(message.cellContext);
+    const frameValidation = validateWriteFrameForContext(context);
+    if (!frameValidation.ok) return { ok: false, reason: "NON_SHEET_FRAME" };
 
     if (context) {
       const focusResult = focusCellByPointDetailed(context);
@@ -261,12 +316,14 @@
   async function writeCellFromPanelDetailed(message) {
     const text = normalizeWriteText(message && message.text);
     const requestedContext = normalizeCellContext(message && message.cellContext);
-    const context = requestedContext || lastCellContext || null;
-    const debugSession = createWriteDebugSession(message, text, requestedContext, context);
+    const targetResolution = resolveWriteTargetContext(message, requestedContext);
+    const context = targetResolution.context;
+    const debugSession = createWriteDebugSession(message, text, requestedContext, context, targetResolution);
     let step = 1;
 
     pushWriteAttempt(debugSession, {
       step: step++,
+      stage: "request_received",
       source: "写回请求",
       hit: true,
       reason: "received",
@@ -278,11 +335,32 @@
       }
     });
 
+    const frameValidation = validateWriteFrameForContext(context);
+    pushWriteAttempt(debugSession, {
+      step: step++,
+      stage: "frame_validation",
+      source: "write_frame_validation",
+      hit: Boolean(frameValidation && frameValidation.ok),
+      reason: frameValidation && frameValidation.reason ? frameValidation.reason : "unknown",
+      candidateText: "",
+      details: frameValidation
+    });
+
+    if (!frameValidation || !frameValidation.ok) {
+      emitWriteDebugSession(debugSession, "error", "NON_SHEET_FRAME");
+      return {
+        ok: false,
+        reason: "NON_SHEET_FRAME",
+        debugSessionId: debugSession.id
+      };
+    }
+
     let focusResult = null;
     if (context) {
       focusResult = focusCellByPointDetailed(context);
       pushWriteAttempt(debugSession, {
         step: step++,
+        stage: "focus_cell",
         source: "定位并激活单元格",
         hit: Boolean(focusResult && focusResult.ok),
         reason: focusResult && focusResult.reason ? focusResult.reason : "unknown",
@@ -293,6 +371,7 @@
     } else {
       pushWriteAttempt(debugSession, {
         step: step++,
+        stage: "focus_cell",
         source: "定位并激活单元格",
         hit: false,
         reason: "missing_cell_context",
@@ -307,6 +386,7 @@
     const activeAfterFocus = getDeepActiveElement();
     pushWriteAttempt(debugSession, {
       step: step++,
+      stage: "active_snapshot",
       source: "焦点元素快照",
       hit: activeAfterFocus instanceof Element,
       reason: activeAfterFocus instanceof Element ? "active_element_detected" : "active_element_missing",
@@ -317,6 +397,7 @@
     if (!context || (focusResult && !focusResult.ok)) {
       pushWriteAttempt(debugSession, {
         step: step++,
+        stage: "stop_write",
         source: "中止写回",
         hit: false,
         reason: !context ? "missing_cell_context" : "target_cell_focus_failed",
@@ -340,6 +421,7 @@
       const clearResult = await runClearCellStrategy(context);
       pushWriteAttempt(debugSession, {
         step: step++,
+        stage: "clear_strategy",
         source: "clear_cell_strategy",
         hit: Boolean(clearResult && clearResult.ok),
         reason: clearResult && clearResult.reason ? clearResult.reason : "unknown",
@@ -351,6 +433,7 @@
         emitCellSelected(text, "clear_cell", context);
         pushWriteAttempt(debugSession, {
           step: step++,
+          stage: "panel_preview",
           source: "panel_preview",
           hit: true,
           reason: "sent_after_clear",
@@ -362,10 +445,72 @@
       }
     }
 
+    if (!isClearingCell && shouldPreferNativePasteFirst()) {
+      pushWriteAttempt(debugSession, {
+        step: step++,
+        stage: "synthetic_paste_skipped",
+        source: "synthetic_paste_skipped",
+        hit: false,
+        reason: "native_paste_first",
+        candidateText: "",
+        details: getWriteStrategyAdaptationState()
+      });
+
+      const preferredNativePasteResult = await runNativeClipboardPasteStrategy(text, context, {
+        clipboardPrimed: Boolean(message && message.clipboardPrimed)
+      });
+      pushWriteAttempt(debugSession, {
+        step: step++,
+        stage: "native_paste_strategy",
+        source: "native_paste_strategy",
+        hit: Boolean(preferredNativePasteResult && preferredNativePasteResult.ok),
+        reason: preferredNativePasteResult && preferredNativePasteResult.reason ? preferredNativePasteResult.reason : "unknown",
+        candidateText: preferredNativePasteResult && typeof preferredNativePasteResult.observedFormula === "string" ? preferredNativePasteResult.observedFormula : "",
+        details: preferredNativePasteResult
+      });
+
+      if (preferredNativePasteResult && preferredNativePasteResult.ok) {
+        emitCellSelected(text, "native_paste_writeback", context);
+        pushWriteAttempt(debugSession, {
+          step: step++,
+          stage: "panel_preview",
+          source: "panel_preview",
+          hit: true,
+          reason: "sent_after_native_paste",
+          candidateText: text,
+          details: { source: "native_paste_writeback", nativeFirst: true }
+        });
+        emitWriteDebugSession(debugSession, "success", "native_paste_ok");
+        return { ok: true, debugSessionId: debugSession.id, writeStrategy: "native_paste_first" };
+      }
+
+      if (isNativePasteLikelyDispatched(preferredNativePasteResult)) {
+        emitCellSelected(text, "native_paste_pending_lark_sync", context);
+        pushWriteAttempt(debugSession, {
+          step: step++,
+          stage: "panel_preview",
+          source: "panel_preview",
+          hit: true,
+          reason: "sent_after_native_paste_pending_lark_sync",
+          candidateText: text,
+          details: { source: "native_paste_pending_lark_sync", nativeFirst: true }
+        });
+        emitWriteDebugSession(debugSession, "success", "native_paste_dispatched_pending_lark_sync");
+        return {
+          ok: true,
+          debugSessionId: debugSession.id,
+          writeStrategy: "native_paste_first_pending_lark_sync",
+          pendingVerification: true
+        };
+      }
+
+    }
+
     if (!isClearingCell) {
     const pasteResult = await runPasteWriteStrategy(text, context);
     pushWriteAttempt(debugSession, {
       step: step++,
+      stage: "paste_strategy",
       source: "粘贴写入策略",
       hit: Boolean(pasteResult && pasteResult.ok),
       reason: pasteResult && pasteResult.reason ? pasteResult.reason : "unknown",
@@ -377,6 +522,7 @@
       emitCellSelected(text, "粘贴写回", context);
       pushWriteAttempt(debugSession, {
         step: step++,
+        stage: "panel_preview",
         source: "回传侧栏预览",
         hit: true,
         reason: "sent_after_paste",
@@ -387,57 +533,13 @@
       return { ok: true, debugSessionId: debugSession.id, writeStrategy: "paste" };
     }
 
-    const nativePasteResult = await runNativeClipboardPasteStrategy(text, context, {
-      clipboardPrimed: Boolean(message && message.clipboardPrimed)
-    });
-    pushWriteAttempt(debugSession, {
-      step: step++,
-      source: "原生剪贴板粘贴策略",
-      hit: Boolean(nativePasteResult && nativePasteResult.ok),
-      reason: nativePasteResult && nativePasteResult.reason ? nativePasteResult.reason : "unknown",
-      candidateText: nativePasteResult && typeof nativePasteResult.observedFormula === "string" ? nativePasteResult.observedFormula : "",
-      details: nativePasteResult
-    });
-
-    if (nativePasteResult && nativePasteResult.ok) {
-      emitCellSelected(text, "原生粘贴写回", context);
-      pushWriteAttempt(debugSession, {
-        step: step++,
-        source: "回传侧栏预览",
-        hit: true,
-        reason: "sent_after_native_paste",
-        candidateText: text,
-        details: { source: "原生粘贴写回" }
-      });
-      emitWriteDebugSession(debugSession, "success", "native_paste_ok");
-      return { ok: true, debugSessionId: debugSession.id, writeStrategy: "native_paste" };
-    }
-
-    if (isNativePasteLikelyDispatched(nativePasteResult)) {
-      emitCellSelected(text, "原生粘贴写回(等待飞书同步)", context);
-      pushWriteAttempt(debugSession, {
-        step: step++,
-        source: "回传侧栏预览",
-        hit: true,
-        reason: "sent_after_native_paste_pending_lark_sync",
-        candidateText: text,
-        details: { source: "原生粘贴写回(等待飞书同步)" }
-      });
-      emitWriteDebugSession(debugSession, "success", "native_paste_dispatched_pending_lark_sync");
-      return {
-        ok: true,
-        debugSessionId: debugSession.id,
-        writeStrategy: "native_paste_pending_lark_sync",
-        pendingVerification: true
-      };
-    }
-
     }
 
     const editorSelection = findWriteTargetEditorDetailed(context);
     const editor = editorSelection.editor;
     pushWriteAttempt(debugSession, {
       step: step++,
+      stage: "editor_selection",
       source: "编辑器选择",
       hit: Boolean(editor),
       reason: editorSelection.reason || (editor ? "ok" : "not_found"),
@@ -463,6 +565,7 @@
     const afterWrite = extractEditableText(editor);
     pushWriteAttempt(debugSession, {
       step: step++,
+      stage: "editor_set_text",
       source: "写入编辑器",
       hit: Boolean(setResult && setResult.ok !== false),
       reason: setResult && setResult.reason ? setResult.reason : "ok",
@@ -479,6 +582,7 @@
     const commitResult = commitEditorDetailed(editor);
     pushWriteAttempt(debugSession, {
       step: step++,
+      stage: "editor_commit",
       source: "提交编辑内容",
       hit: Boolean(commitResult && commitResult.ok),
       reason: commitResult && commitResult.reason ? commitResult.reason : "unknown",
@@ -489,6 +593,7 @@
     const verifyResult = await verifyWritePersisted(text, context, editor);
     pushWriteAttempt(debugSession, {
       step: step++,
+      stage: "editor_verify",
       source: "写回落盘校验",
       hit: Boolean(verifyResult && verifyResult.ok),
       reason: verifyResult && verifyResult.reason ? verifyResult.reason : "unknown",
@@ -500,6 +605,7 @@
       emitCellSelected(text, "输入模式写回(等待飞书同步)", context);
       pushWriteAttempt(debugSession, {
         step: step++,
+        stage: "panel_preview",
         source: "回传侧栏预览",
         hit: true,
         reason: "sent_after_editor_commit_pending_lark_sync",
@@ -523,6 +629,7 @@
     emitCellSelected(text, "输入模式写回", context);
     pushWriteAttempt(debugSession, {
       step: step++,
+      stage: "panel_preview",
       source: "回传侧栏预览",
       hit: true,
       reason: "sent",
@@ -532,6 +639,25 @@
 
     emitWriteDebugSession(debugSession, "success", "ok");
     return { ok: true, debugSessionId: debugSession.id };
+  }
+
+  function resolveWriteTargetContext(message, requestedContext) {
+    const paneLocked = Boolean(message && message.paneLocked);
+    const writeTargetMode = message && message.writeTargetMode ? String(message.writeTargetMode) : "";
+    const mode = writeTargetMode === "typing_snapshot"
+      ? "typing_snapshot_context"
+      : (paneLocked ? "locked_pane_context" : "requested_context");
+    return {
+      context: requestedContext || null,
+      mode,
+      writeTargetMode,
+      paneLocked,
+      requestedContext: requestedContext || null,
+      displayContext: normalizeCellContext(message && message.displayContext),
+      typingSnapshotContext: normalizeCellContext(message && message.typingSnapshotContext),
+      currentFocusContext: null,
+      currentFocusTarget: null
+    };
   }
 
   function findWriteTargetEditor(context) {
@@ -822,7 +948,7 @@
     };
   }
 
-  function createWriteDebugSession(message, text, requestedContext, resolvedContext) {
+  function createWriteDebugSession(message, text, requestedContext, resolvedContext, targetResolution) {
     return {
       id: `write-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       url: location.href,
@@ -838,8 +964,16 @@
         textSample: sampleText(text),
         requestedContext: requestedContext || null,
         resolvedContext: resolvedContext || null,
+        displayContext: normalizeCellContext(message && message.displayContext),
+        displayCellAddress: normalizeCellAddress(message && message.displayCellAddress),
+        typingSnapshotContext: normalizeCellContext(message && message.typingSnapshotContext),
+        typingSnapshotAddress: normalizeCellAddress(message && message.typingSnapshotAddress),
+        writeContext: resolvedContext || null,
+        writeTargetMode: message && message.writeTargetMode ? String(message.writeTargetMode) : "",
         incomingCellContext: normalizeCellContext(message && message.cellContext),
         cachedCellContext: lastCellContext || null,
+        paneLocked: Boolean(message && message.paneLocked),
+        targetResolution: targetResolution || null,
         clipboardPrimed: Boolean(message && message.clipboardPrimed),
         clipboardPrime: message && message.clipboardPrime ? message.clipboardPrime : null,
         frameInfo: {
@@ -852,6 +986,7 @@
   }
 
   function emitWriteDebugSession(session, status, reason) {
+    const durationMs = Math.max(0, Math.round(performance.now() - session.startedMs));
     sendMessage({
       type: "FZ_CAPTURE_DEBUG",
       debug: {
@@ -860,9 +995,10 @@
         clickTarget: session.clickTarget,
         startedAt: session.startedAt,
         endedAt: new Date().toISOString(),
-        durationMs: Math.max(0, Math.round(performance.now() - session.startedMs)),
+        durationMs,
         attempts: session.attempts,
         writeRequest: session.writeRequest,
+        writePerformance: buildWritePerformanceSummary(session, status, reason, durationMs),
         finalResult: {
           status: status === "success" ? "success" : "error",
           chosenSource: "写回链路",
@@ -872,10 +1008,99 @@
     });
   }
 
+  function buildWritePerformanceSummary(session, status, reason, durationMs) {
+    const attempts = Array.isArray(session && session.attempts) ? session.attempts : [];
+    const strategyStages = {
+      clear_strategy: "clear",
+      paste_strategy: "synthetic_paste",
+      native_paste_strategy: "native_clipboard_paste",
+      editor_selection: "editor_direct_write",
+      editor_set_text: "editor_direct_write",
+      editor_commit: "editor_direct_write",
+      editor_verify: "editor_direct_write"
+    };
+    const attemptedStrategies = {};
+    const fallbackPath = [];
+    const allStrategies = ["clear", "synthetic_paste", "native_clipboard_paste", "editor_direct_write"];
+    const stageTimings = attempts.map((attempt, index) => {
+      const elapsedMs = Number(attempt && attempt.elapsedMs);
+      const previousElapsedMs = index > 0 ? Number(attempts[index - 1] && attempts[index - 1].elapsedMs) : 0;
+      const deltaMs = Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs - (Number.isFinite(previousElapsedMs) ? previousElapsedMs : 0)) : 0;
+      const stage = attempt && attempt.stage ? attempt.stage : `step_${Number(attempt && attempt.step || index + 1)}`;
+      const strategy = strategyStages[stage] || "";
+      if (strategy && !attemptedStrategies[strategy]) {
+        attemptedStrategies[strategy] = true;
+        fallbackPath.push(strategy);
+      }
+      return {
+        step: Number(attempt && attempt.step || index + 1),
+        stage,
+        deltaMs,
+        elapsedMs: Number.isFinite(elapsedMs) ? elapsedMs : 0,
+        hit: Boolean(attempt && attempt.hit),
+        reason: attempt && attempt.reason ? attempt.reason : "",
+        waitMsInDetails: sumWaitMs(attempt && attempt.details)
+      };
+    });
+
+    const slowestStages = stageTimings
+      .slice()
+      .sort((a, b) => b.deltaMs - a.deltaMs)
+      .slice(0, 5);
+
+    return {
+      totalMs: durationMs,
+      status: status === "success" ? "success" : "error",
+      finalReason: reason || "",
+      attemptedStrategies,
+      skippedStrategies: allStrategies.filter((strategy) => !attemptedStrategies[strategy]),
+      successfulStrategy: inferSuccessfulWriteStrategy(reason),
+      adaptation: getWriteStrategyAdaptationState(),
+      fallbackPath,
+      slowestStages,
+      stageTimings
+    };
+  }
+
+  function inferSuccessfulWriteStrategy(reason) {
+    const text = String(reason || "");
+    if (text.includes("clear")) return "clear";
+    if (text.includes("native_paste")) return "native_clipboard_paste";
+    if (text.includes("paste")) return "synthetic_paste";
+    if (text.includes("editor") || text === "ok") return "editor_direct_write";
+    return "";
+  }
+
+  function shouldPreferNativePasteFirst() {
+    return true;
+  }
+
+  function getWriteStrategyAdaptationState() {
+    return {
+      mode: "native_paste_first",
+      preferNativePaste: true
+    };
+  }
+
+  function sumWaitMs(value) {
+    if (value == null) return 0;
+    if (Array.isArray(value)) {
+      return value.reduce((total, item) => total + sumWaitMs(item), 0);
+    }
+    if (typeof value === "object") {
+      return Object.keys(value).reduce((total, key) => {
+        const own = key === "waitMs" && Number.isFinite(Number(value[key])) ? Number(value[key]) : 0;
+        return total + own + sumWaitMs(value[key]);
+      }, 0);
+    }
+    return 0;
+  }
+
   function pushWriteAttempt(session, payload) {
     const candidateText = typeof payload.candidateText === "string" ? payload.candidateText : "";
     pushAttempt(session, {
       step: Number(payload.step || 0),
+      stage: payload.stage || "",
       source: payload.source || "",
       elapsedMs: elapsedMs(session),
       hit: Boolean(payload.hit),
@@ -940,6 +1165,31 @@
       context: { x, y },
       target: describeElementForDebug(target),
       dispatches
+    };
+  }
+
+  function validateWriteFrameForContext(context) {
+    if (!context) {
+      return {
+        ok: true,
+        reason: "missing_context_checked_later",
+        frameUrl: location.href,
+        isTopFrame: window === window.top
+      };
+    }
+
+    const hasSheetCanvas = Boolean(document.querySelector("canvas.faster-single-canvas"));
+    const hasFormulaEditor = Boolean(findBestFormulaEditor());
+    const isAboutBlankFrame = window !== window.top && location.href === "about:blank";
+    const ok = !isAboutBlankFrame && (hasSheetCanvas || hasFormulaEditor);
+    return {
+      ok,
+      reason: ok ? "sheet_frame_detected" : "non_sheet_frame",
+      frameUrl: location.href,
+      isTopFrame: window === window.top,
+      hasSheetCanvas,
+      hasFormulaEditor,
+      context
     };
   }
 
@@ -1128,6 +1378,52 @@
     if (sourceKey && sourceKey.startsWith("formula") && isCurrentCellAddressToken(text, cellAddress)) return { status: "reject", reason: "cell_address_token" };
     if (!isUsefulText(text)) return { status: "reject", reason: "not_useful" };
     return { status: "success", reason: "ok" };
+  }
+
+  function refineFormulaCaptureEvaluation(session, sourceKey, text, evaluation) {
+    if (!session || sourceKey !== "formula" || !evaluation || evaluation.status !== "success") return evaluation;
+
+    const elapsed = elapsedMs(session);
+    if (elapsed < FORMULA_CAPTURE_MIN_ACCEPT_MS) {
+      return {
+        status: "reject",
+        reason: "formula_pending_sync",
+        details: {
+          elapsedMs: elapsed,
+          minAcceptMs: FORMULA_CAPTURE_MIN_ACCEPT_MS
+        }
+      };
+    }
+
+    if (isLikelyPreviousCellFormulaText(session, text)) {
+      session.sawStalePreviousFormula = true;
+      return {
+        status: "reject",
+        reason: "formula_matches_previous_cell",
+        details: {
+          elapsedMs: elapsed,
+          previousCellAddress: lastCaptureResult && lastCaptureResult.cellAddress ? lastCaptureResult.cellAddress : "",
+          currentCellAddress: session.cellAddress || ""
+        }
+      };
+    }
+
+    return evaluation;
+  }
+
+  function isLikelyPreviousCellFormulaText(session, text) {
+    if (!lastCaptureResult || !text) return false;
+    if (text !== lastCaptureResult.text) return false;
+    const previousAddress = normalizeCellAddress(lastCaptureResult.cellAddress);
+    const currentAddress = normalizeCellAddress(session && session.cellAddress);
+    return Boolean(previousAddress && currentAddress && previousAddress !== currentAddress);
+  }
+
+  function rememberCaptureResult(text, cellAddress) {
+    lastCaptureResult = {
+      text: normalizeCellText(text),
+      cellAddress: normalizeCellAddress(cellAddress)
+    };
   }
 
   function isCurrentCellAddressToken(text, cellAddress) {
