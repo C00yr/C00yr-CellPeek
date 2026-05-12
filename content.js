@@ -11,6 +11,7 @@
   const MAX_SEARCH_DEPTH = 10;
   const KEYBOARD_CAPTURE_DELAY_MS = 80;
   const FORMULA_CAPTURE_MIN_ACCEPT_MS = 200;
+  const FORMULA_SAME_TEXT_SETTLE_MS = 650;
 
   const CELL_SELECTOR = "[role='gridcell'], [data-cell], [data-cell-id], td, th";
   const EDITOR_SELECTOR = "[contenteditable]:not([contenteditable='false']),textarea,input[type='text'],input:not([type]),[role='textbox']";
@@ -1396,14 +1397,30 @@
     }
 
     if (isLikelyPreviousCellFormulaText(session, text)) {
+      const previousCellAddress = lastCaptureResult && lastCaptureResult.cellAddress ? lastCaptureResult.cellAddress : "";
+      const currentCellAddress = session.cellAddress || "";
+      if (elapsed >= FORMULA_SAME_TEXT_SETTLE_MS) {
+        return {
+          status: "success",
+          reason: "accepted_same_text_after_settle",
+          details: {
+            elapsedMs: elapsed,
+            settleMs: FORMULA_SAME_TEXT_SETTLE_MS,
+            previousCellAddress,
+            currentCellAddress
+          }
+        };
+      }
+
       session.sawStalePreviousFormula = true;
       return {
         status: "reject",
         reason: "formula_matches_previous_cell",
         details: {
           elapsedMs: elapsed,
-          previousCellAddress: lastCaptureResult && lastCaptureResult.cellAddress ? lastCaptureResult.cellAddress : "",
-          currentCellAddress: session.cellAddress || ""
+          settleMs: FORMULA_SAME_TEXT_SETTLE_MS,
+          previousCellAddress,
+          currentCellAddress
         }
       };
     }
